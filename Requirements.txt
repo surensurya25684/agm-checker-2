@@ -1,4 +1,4 @@
 pandas 
-edgar-utils 
+sec-edgar-downloader
 streamlit 
 xlsxwriter 
