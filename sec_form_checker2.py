@@ -1,14 +1,23 @@
 import pandas as pd
 import streamlit as st
-from edgar_utils import get_filings
+from sec_edgar_downloader import Downloader
 from io import BytesIO
+import os
+
+# Initialize SEC Downloader with data directory
+email = "your-email@example.com"  # SEC requires an email for identity
+dl = Downloader("data", email)
 
 # Streamlit UI
 st.title("SEC Form 5.07 Finder")
 
 # Sidebar: User Identity
 st.sidebar.header("User Settings")
-email = st.sidebar.text_input("Enter your email (not mandatory but recommended)", placeholder="example@domain.com")
+email_input = st.sidebar.text_input("Enter your email (required by SEC):", placeholder="example@domain.com")
+
+if email_input:
+    dl = Downloader("data", email_input)
+    st.sidebar.success("Email Set Successfully!")
 
 # Upload Excel File
 uploaded_file = st.file_uploader("Upload an Excel file with CIK numbers", type=['xlsx'])
@@ -38,23 +47,23 @@ if uploaded_file or manual_cik:
         st.write(f"Processing CIK: {cik} ({company_name})...")
 
         try:
-            filings = get_filings(cik=cik, form_type="8-K", year=2024)
+            # Download 8-K filings for 2024
+            dl.get("8-K", cik, after="2024-01-01", before="2024-12-31")
 
-            # Check for Item 5.07 in the filings
-            form_507_found = False
-            form_507_link = None
-
-            for filing in filings:
-                if "5.07" in filing['items']:
-                    form_507_found = True
-                    form_507_link = f"https://www.sec.gov/Archives/edgar/data/{cik}/{filing['accession_number'].replace('-', '')}/index.html"
-                    break  # Stop after finding the first match
+            # Check if any filings were downloaded
+            filings_dir = f"data/sec-edgar-filings/{cik}/8-K/"
+            if os.path.exists(filings_dir) and os.listdir(filings_dir):
+                form_507_link = f"https://www.sec.gov/edgar/browse/?CIK={cik}"
+                form_507_found = "Yes"
+            else:
+                form_507_link = "Not Found"
+                form_507_found = "No"
 
             results.append({
                 "CIK": cik,
                 "Company Name": company_name,
-                "Form_5.07_Available": "Yes" if form_507_found else "No",
-                "Form_5.07_Link": form_507_link if form_507_found else f"https://www.sec.gov/edgar/browse/?CIK={cik}"
+                "Form_5.07_Available": form_507_found,
+                "Form_5.07_Link": form_507_link
             })
 
         except Exception as e:
