@@ -1,5 +1,4 @@
 pandas 
-edgar 
+edgar-utils 
 streamlit 
 xlsxwriter 
-io.BytesIO
