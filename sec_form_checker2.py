@@ -1,92 +1,120 @@
-import pandas as pd
 import streamlit as st
-from sec_edgar_downloader import Downloader
-from io import BytesIO
-import os
+import pandas as pd
+import io
+from edgar import Company, set_identity
 
-# Initialize SEC Downloader with data directory
-email = "your-email@example.com"  # SEC requires an email for identity
-dl = Downloader("data", email)
+st.title("Form 5.07 Checker")
 
-# Streamlit UI
-st.title("SEC Form 5.07 Finder")
+# Sidebar or main input for the SEC identity email
+email = st.text_input("Enter your SEC EDGAR Identity Email", "suren.surya@msci.com")
 
-# Sidebar: User Identity
-st.sidebar.header("User Settings")
-email_input = st.sidebar.text_input("Enter your email (required by SEC):", placeholder="example@domain.com")
+# File uploader for the input Excel file
+uploaded_file = st.file_uploader("Upload Excel file with companies", type=['xlsx', 'xls'])
 
-if email_input:
-    dl = Downloader("data", email_input)
-    st.sidebar.success("Email Set Successfully!")
+if uploaded_file is not None:
+    # Read and preview the input file
+    companies_df = pd.read_excel(uploaded_file)
+    companies_df.columns = companies_df.columns.str.strip()  # Clean up column names
+    st.write("### Preview of Input File")
+    st.dataframe(companies_df.head())
 
-# Upload Excel File
-uploaded_file = st.file_uploader("Upload an Excel file with CIK numbers", type=['xlsx'])
-
-# Manual CIK input
-manual_cik = st.text_input("Or enter a CIK number manually:", placeholder="Enter CIK")
-
-# Process Data
-if uploaded_file or manual_cik:
-    results = []
-
-    if uploaded_file:
-        df = pd.read_excel(uploaded_file)
-        df.columns = df.columns.str.strip()
-        
-        if 'CIK' not in df.columns:
-            st.error("Error: The uploaded file must contain a 'CIK' column.")
-        else:
-            process_list = df.to_dict(orient='records')
+if st.button("Run Processing"):
+    if uploaded_file is None:
+        st.error("Please upload an Excel file to proceed.")
     else:
-        process_list = [{"CIK": manual_cik, "Company Name": "Manual Entry"}]
+        # Set the SEC EDGAR identity email
+        set_identity(email)
+        results = []
 
-    for row in process_list:
-        cik = str(row.get('CIK', '')).zfill(10)  # Ensure CIK is in 10-digit format
-        company_name = row.get('Company Name', 'Unknown')
+        st.info("Processing companies. This may take a moment...")
+        # Iterate through each company in the input DataFrame
+        for index, row in companies_df.iterrows():
+            cik = row.get('CIK', None)
+            company_name = row.get('Company Name', 'Unknown')
+            issuer_id = row.get('Issuer id', 'Unknown')
+            analyst_name = row.get('Analyst name', 'Unknown')
 
-        st.write(f"Processing CIK: {cik} ({company_name})...")
+            if cik is None:
+                st.warning(f"CIK not found for row {index}. Skipping.")
+                results.append({
+                    "CIK": "Unknown",
+                    "Issuer id": issuer_id,
+                    "Company Name": company_name,
+                    "Analyst Name": analyst_name,
+                    "Form_5.07_Available": "No CIK Found",
+                    "Form_5.07_Link1": "Not Available"
+                })
+                continue
 
-        try:
-            # Download 8-K filings for 2024
-            dl.get("8-K", cik, after="2024-01-01", before="2024-12-31")
+            st.write(f"Processing company with CIK: {cik} ({company_name})")
+            try:
+                company = Company(cik)
+                filings = company.get_filings(form="8-K")
 
-            # Check if any filings were downloaded
-            filings_dir = f"data/sec-edgar-filings/{cik}/8-K/"
-            if os.path.exists(filings_dir) and os.listdir(filings_dir):
-                form_507_link = f"https://www.sec.gov/edgar/browse/?CIK={cik}"
-                form_507_found = "Yes"
-            else:
-                form_507_link = "Not Found"
-                form_507_found = "No"
+                # List to store all matching Form 5.07 links
+                links = []
+                for filing in filings:
+                    try:
+                        if hasattr(filing, 'items') and '5.07' in filing.items:
+                            if hasattr(filing, 'filing_date'):
+                                filing_date = filing.filing_date.strftime('%Y-%m-%d')
+                                if filing_date.startswith("2024"):
+                                    formatted_accession_number = filing.accession_number.replace('-', '')
+                                    link = f"https://www.sec.gov/Archives/edgar/data/{cik}/{formatted_accession_number}/index.html"
+                                    links.append(link)
+                    except Exception as e:
+                        st.write(f"Error processing a filing for CIK {cik}: {e}")
 
-            results.append({
-                "CIK": cik,
-                "Company Name": company_name,
-                "Form_5.07_Available": form_507_found,
-                "Form_5.07_Link": form_507_link
-            })
+                # Build result dictionary with base fields
+                result = {
+                    "CIK": cik,
+                    "Issuer id": issuer_id,
+                    "Company Name": company_name,
+                    "Analyst Name": analyst_name,
+                    "Form_5.07_Available": "Yes" if links else "No"
+                }
 
-        except Exception as e:
-            st.error(f"Error processing CIK {cik}: {e}")
-            results.append({
-                "CIK": cik,
-                "Company Name": company_name,
-                "Form_5.07_Available": "Error",
-                "Form_5.07_Link": "Not Found"
-            })
+                # Add each link to its own column (Form_5.07_Link1, Form_5.07_Link2, etc.)
+                if links:
+                    for idx, link in enumerate(links, start=1):
+                        result[f"Form_5.07_Link{idx}"] = link
+                else:
+                    result["Form_5.07_Link1"] = f"https://www.sec.gov/Archives/edgar/data/{cik}/NotFound.htm"
 
-    results_df = pd.DataFrame(results)
-    st.dataframe(results_df)
+                results.append(result)
+            except Exception as e:
+                st.write(f"Error processing company with CIK {cik}: {e}")
+                results.append({
+                    "CIK": cik,
+                    "Issuer id": issuer_id,
+                    "Company Name": company_name,
+                    "Analyst Name": analyst_name,
+                    "Form_5.07_Available": "Error",
+                    "Form_5.07_Link1": None
+                })
 
-    # Download Results as Excel
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        results_df.to_excel(writer, index=False)
-    output.seek(0)
+        # Convert results to a DataFrame
+        results_df = pd.DataFrame(results)
 
-    st.download_button(
-        label="Download Results as Excel",
-        data=output,
-        file_name="Form_5.07_Results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        # Reorder columns: placing "Issuer id" as the second column
+        base_columns = ['CIK', 'Issuer id', 'Company Name', 'Analyst Name', 'Form_5.07_Available']
+        link_columns = sorted(
+            [col for col in results_df.columns if col.startswith('Form_5.07_Link')],
+            key=lambda x: int(x.replace('Form_5.07_Link', ''))
+        )
+        ordered_columns = base_columns + link_columns
+        results_df = results_df[ordered_columns]
+
+        # Create an in-memory Excel file
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            results_df.to_excel(writer, index=False)
+        output.seek(0)
+
+        st.success("Processing complete!")
+        st.download_button(
+            label="Download Output Excel",
+            data=output,
+            file_name="output_file.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
