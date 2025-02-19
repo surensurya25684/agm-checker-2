@@ -1,4 +1,5 @@
-pandas 
-sec-edgar-downloader
-streamlit 
-xlsxwriter 
+streamlit
+pandas
+openpyxl
+xlsxwriter
+edgar
