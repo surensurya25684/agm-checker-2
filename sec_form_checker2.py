@@ -1,4 +1,7 @@
 import streamlit as st
+import sys
+print("Python executable:", sys.executable)
+
 import pandas as pd
 import io
 from edgar import Company, set_identity
