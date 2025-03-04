@@ -1,123 +1,113 @@
 import streamlit as st
-import sys
-print("Python executable:", sys.executable)
+import datetime
+from secedgar.filings import Filing, FilingType
+from secedgar.client import NetworkClient
+from secedgar.utils import get_cik_map
 
-import pandas as pd
-import io
-from edgar import Company, set_identity
+# Optional: A small helper dict to map user-friendly form labels to FilingType
+FORM_TYPE_MAP = {
+    "10-K": FilingType.FILING_10K,
+    "10-Q": FilingType.FILING_10Q,
+    "8-K" : FilingType.FILING_8K,
+    "DEF 14A": FilingType.FILING_DEFA14A,
+    # Add others as needed
+}
 
-st.title("Form 5.07 Checker")
+def main():
+    st.title("Bulk SEC Filings Search")
+    st.write("Search EDGAR for multiple tickers and specific filing types.")
 
-# Sidebar or main input for the SEC identity email
-email = st.text_input("Enter your SEC EDGAR Identity Email", "suren.surya@msci.com")
+    # --- 1) Collect user inputs ---
+    # A) EDGAR Identity
+    user_agent = st.text_input(
+        "Enter your EDGAR user agent identity (required by SEC)",
+        "MyApp/1.0 (your_email@example.com)"
+    )
+    
+    # B) Tickers Input (bulk)
+    tickers_input = st.text_area(
+        "Enter ticker symbols (one per line):",
+        value="AAPL\nMSFT\nAMZN",
+        help="Enter as many tickers as you like. Example:\nAAPL\nMSFT\nAMZN"
+    )
 
-# File uploader for the input Excel file
-uploaded_file = st.file_uploader("Upload Excel file with companies", type=['xlsx', 'xls'])
+    # C) Form Types
+    form_options = list(FORM_TYPE_MAP.keys())  # e.g., ["10-K", "10-Q", "8-K", ...]
+    selected_form_types = st.multiselect(
+        "Select form types to retrieve:",
+        form_options,
+        default=["10-K"]
+    )
 
-if uploaded_file is not None:
-    # Read and preview the input file
-    companies_df = pd.read_excel(uploaded_file)
-    companies_df.columns = companies_df.columns.str.strip()  # Clean up column names
-    st.write("### Preview of Input File")
-    st.dataframe(companies_df.head())
+    # D) Date Range (optional)
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("Start date:", datetime.date(2020, 1, 1))
+    with col2:
+        end_date = st.date_input("End date:", datetime.date.today())
 
-if st.button("Run Processing"):
-    if uploaded_file is None:
-        st.error("Please upload an Excel file to proceed.")
-    else:
-        # Set the SEC EDGAR identity email
-        set_identity(email)
-        results = []
+    # --- 2) Trigger search on button click ---
+    if st.button("Search Filings"):
+        # Clean up user inputs
+        tickers = [
+            t.strip().upper() for t in tickers_input.split("\n") 
+            if t.strip()
+        ]
 
-        st.info("Processing companies. This may take a moment...")
-        # Iterate through each company in the input DataFrame
-        for index, row in companies_df.iterrows():
-            cik = row.get('CIK', None)
-            company_name = row.get('Company Name', 'Unknown')
-            issuer_id = row.get('Issuer id', 'Unknown')
-            analyst_name = row.get('Analyst name', 'Unknown')
+        # Create a NetworkClient with your user agent (identity)
+        client = NetworkClient(user_agent=user_agent)
 
-            if cik is None:
-                st.warning(f"CIK not found for row {index}. Skipping.")
-                results.append({
-                    "CIK": "Unknown",
-                    "Issuer id": issuer_id,
-                    "Company Name": company_name,
-                    "Analyst Name": analyst_name,
-                    "Form_5.07_Available": "No CIK Found",
-                    "Form_5.07_Link1": "Not Available"
-                })
-                continue
+        # Prepare a container for search results
+        search_results = []
 
-            st.write(f"Processing company with CIK: {cik} ({company_name})")
+        # --- 3) For each ticker, retrieve the desired filings ---
+        for ticker in tickers:
+            st.write(f"### Results for {ticker}")
             try:
-                company = Company(cik)
-                filings = company.get_filings(form="8-K")
+                # Convert ticker to CIK (if valid)
+                # get_cik_map returns a dict { "TICKER": "CIK" }
+                cik_map = get_cik_map([ticker])
+                cik = cik_map[ticker]  # May raise KeyError if not found
 
-                # List to store all matching Form 5.07 links
-                links = []
-                for filing in filings:
-                    try:
-                        if hasattr(filing, 'items') and '5.07' in filing.items:
-                            if hasattr(filing, 'filing_date'):
-                                filing_date = filing.filing_date.strftime('%Y-%m-%d')
-                                if filing_date.startswith("2024"):
-                                    formatted_accession_number = filing.accession_number.replace('-', '')
-                                    link = f"https://www.sec.gov/Archives/edgar/data/{cik}/{formatted_accession_number}/index.html"
-                                    links.append(link)
-                    except Exception as e:
-                        st.write(f"Error processing a filing for CIK {cik}: {e}")
+                # For each selected form type, gather filing metadata/urls
+                for form_name in selected_form_types:
+                    filing_type_obj = FORM_TYPE_MAP.get(form_name)
+                    if not filing_type_obj:
+                        continue
 
-                # Build result dictionary with base fields
-                result = {
-                    "CIK": cik,
-                    "Issuer id": issuer_id,
-                    "Company Name": company_name,
-                    "Analyst Name": analyst_name,
-                    "Form_5.07_Available": "Yes" if links else "No"
-                }
+                    # Create Filing object
+                    filing = Filing(
+                        cik_lookup=cik,
+                        filing_type=filing_type_obj,
+                        start_date=start_date,
+                        end_date=end_date,
+                        client=client
+                    )
 
-                # Add each link to its own column (Form_5.07_Link1, Form_5.07_Link2, etc.)
-                if links:
-                    for idx, link in enumerate(links, start=1):
-                        result[f"Form_5.07_Link{idx}"] = link
-                else:
-                    result["Form_5.07_Link1"] = f"https://www.sec.gov/Archives/edgar/data/{cik}/NotFound.htm"
+                    # `get_urls()` returns a list of filing URLs (no local download).
+                    # If you need more detail, use `get_metadata()` or call `.save()`.
+                    urls = filing.get_urls()
 
-                results.append(result)
+                    # Append to our results list
+                    search_results.append({
+                        "ticker": ticker,
+                        "cik": cik,
+                        "form_type": form_name,
+                        "urls": urls
+                    })
+
+                    # Display in Streamlit
+                    st.subheader(f"{form_name} Filings:")
+                    if not urls:
+                        st.write(f"No {form_name} filings found in this date range.")
+                    else:
+                        for link in urls:
+                            st.write(link)
+
             except Exception as e:
-                st.write(f"Error processing company with CIK {cik}: {e}")
-                results.append({
-                    "CIK": cik,
-                    "Issuer id": issuer_id,
-                    "Company Name": company_name,
-                    "Analyst Name": analyst_name,
-                    "Form_5.07_Available": "Error",
-                    "Form_5.07_Link1": None
-                })
+                st.error(f"Error fetching data for {ticker}: {str(e)}")
 
-        # Convert results to a DataFrame
-        results_df = pd.DataFrame(results)
+        # Optionally do something with `search_results` here (export to CSV, etc.)
 
-        # Reorder columns: placing "Issuer id" as the second column
-        base_columns = ['CIK', 'Issuer id', 'Company Name', 'Analyst Name', 'Form_5.07_Available']
-        link_columns = sorted(
-            [col for col in results_df.columns if col.startswith('Form_5.07_Link')],
-            key=lambda x: int(x.replace('Form_5.07_Link', ''))
-        )
-        ordered_columns = base_columns + link_columns
-        results_df = results_df[ordered_columns]
-
-        # Create an in-memory Excel file
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            results_df.to_excel(writer, index=False)
-        output.seek(0)
-
-        st.success("Processing complete!")
-        st.download_button(
-            label="Download Output Excel",
-            data=output,
-            file_name="output_file.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+if __name__ == "__main__":
+    main()
