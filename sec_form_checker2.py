@@ -1,113 +1,282 @@
 import streamlit as st
-import datetime
-from secedgar.filings import Filing, FilingType
-from secedgar.client import NetworkClient
-from secedgar.utils import get_cik_map
+import pandas as pd
+import requests
+from datetime import datetime
+from collections import defaultdict
+import io
 
-# Optional: A small helper dict to map user-friendly form labels to FilingType
-FORM_TYPE_MAP = {
-    "10-K": FilingType.FILING_10K,
-    "10-Q": FilingType.FILING_10Q,
-    "8-K" : FilingType.FILING_8K,
-    "DEF 14A": FilingType.FILING_DEFA14A,
-    # Add others as needed
+# -------------------------------------------------
+# Global dictionary definitions from original code
+# -------------------------------------------------
+FILING_CATEGORIES = {
+    "Annual & Quarterly Reports": ["10-K", "10-K/A", "10-Q", "10-Q/A"],
+    "Current Reports (8-K)": ["8-K", "8-K/A"],
+    "Proxy Statements": [
+        "DEF 14A", "DEFA14A", "DFAN14A",
+        "DEFN14A", "DEFR14A", "DEFM14A",
+        "PRE 14A", "PRER14A", "PREC14A"
+    ],
+    "Ownership Forms": [
+        "3", "3/A", "4", "4/A", "5", "5/A",
+        "SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"
+    ]
 }
 
-def main():
-    st.title("Bulk SEC Filings Search")
-    st.write("Search EDGAR for multiple tickers and specific filing types.")
+FORM_BASE = {
+    # 10-K
+    "10-K":   "10-K", 
+    "10-K/A": "10-K",
+    # 10-Q
+    "10-Q":   "10-Q", 
+    "10-Q/A": "10-Q",
+    # 8-K
+    "8-K":    "8-K",  
+    "8-K/A":  "8-K",
 
-    # --- 1) Collect user inputs ---
-    # A) EDGAR Identity
-    user_agent = st.text_input(
-        "Enter your EDGAR user agent identity (required by SEC)",
-        "MyApp/1.0 (your_email@example.com)"
+    # Proxy forms -> "Proxy"
+    "DEF 14A":   "Proxy",  "DEFA14A":  "Proxy",
+    "DFAN14A":   "Proxy",  "DEFN14A":  "Proxy",
+    "DEFR14A":   "Proxy",  "DEFM14A":  "Proxy",
+    "PRE 14A":   "Proxy",  "PRER14A":  "Proxy",
+    "PREC14A":   "Proxy",
+
+    # Ownership forms -> "Ownership"
+    "3": "Ownership",   "3/A": "Ownership",
+    "4": "Ownership",   "4/A": "Ownership",
+    "5": "Ownership",   "5/A": "Ownership",
+    "SC 13D":   "Ownership",  "SC 13D/A": "Ownership",
+    "SC 13G":   "Ownership",  "SC 13G/A": "Ownership",
+}
+
+def zero_pad_cik(cik):
+    """
+    Ensures the CIK is a zero-padded string of length 10.
+    e.g. 1156375 -> '0001156375'
+    """
+    try:
+        val = int(cik)  # if it's purely numeric
+        return f"{val:010d}"
+    except ValueError:
+        # If cik is not strictly numeric, just return as-is (left-padded).
+        return str(cik).rjust(10, "0")
+
+def fetch_sec_json(cik_str, headers):
+    """
+    Given a zero-padded CIK string like '0001156375',
+    fetch the JSON from https://data.sec.gov/submissions/CIK0001156375.json
+    Returns a dict or None if error/not found.
+    """
+    base_url = "https://data.sec.gov/submissions/CIK{}.json"
+    url = base_url.format(cik_str)
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            st.warning(f"CIK JSON fetch returned {resp.status_code} for {url}.")
+            return None
+    except Exception as ex:
+        st.warning(f"Error fetching {url}: {ex}")
+        return None
+
+def run_app():
+    st.title("SEC Filing Search")
+
+    # 1) User email for the SEC "User-Agent"
+    user_email = st.text_input(
+        "Enter your email (will be used in the SEC User-Agent per compliance)",
+        value="someone@example.com"
     )
-    
-    # B) Tickers Input (bulk)
-    tickers_input = st.text_area(
-        "Enter ticker symbols (one per line):",
-        value="AAPL\nMSFT\nAMZN",
-        help="Enter as many tickers as you like. Example:\nAAPL\nMSFT\nAMZN"
+
+    HEADERS = {"User-Agent": user_email.strip()}
+
+    # 2) Choose category -> forms_we_want
+    category_choice = st.selectbox(
+        "Which category of SEC filings do you want?",
+        list(FILING_CATEGORIES.keys())
+    )
+    forms_we_want = FILING_CATEGORIES[category_choice]
+
+    # 3) Date range pickers (both optional)
+    st.write("**Optionally select a Start and End date.**")
+    start_date = st.date_input("Start Date (optional)", value=None)
+    end_date = st.date_input("End Date (optional)", value=None)
+
+    # If user didn't pick them, we treat as None
+    start_date_val = None if not start_date else datetime.combine(start_date, datetime.min.time())
+    end_date_val = None if not end_date else datetime.combine(end_date, datetime.min.time())
+
+    # 4) 8-K item filter
+    item_filter = []
+    if any(f.startswith("8-K") for f in forms_we_want):
+        st.write("Optionally enter 8-K items to filter by (comma-separated). e.g. `5.02, 5.07`")
+        items_str = st.text_input("8-K Items (blank = none)")
+        if items_str:
+            item_filter = [x.strip() for x in items_str.split(",") if x.strip()]
+
+    st.write("---")
+
+    # 5) Let the user pick how they want to input CIKs:
+    st.write("**Choose how to provide CIKs**:")
+    input_mode = st.radio(
+        "Mode:",
+        ("Upload Excel with CIKs", "Manually enter CIKs")
     )
 
-    # C) Form Types
-    form_options = list(FORM_TYPE_MAP.keys())  # e.g., ["10-K", "10-Q", "8-K", ...]
-    selected_form_types = st.multiselect(
-        "Select form types to retrieve:",
-        form_options,
-        default=["10-K"]
-    )
+    uploaded_file = None
+    manual_ciks = []
+    df = None  # eventually read from Excel if user uploads
 
-    # D) Date Range (optional)
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start date:", datetime.date(2020, 1, 1))
-    with col2:
-        end_date = st.date_input("End date:", datetime.date.today())
+    if input_mode == "Upload Excel with CIKs":
+        uploaded_file = st.file_uploader("Upload an Excel file (XLS/XLSX) with columns like 'CIK', 'Company Name', etc.")
+    else:
+        # Manually input CIKs, comma- or line-separated
+        manual_ciks_str = st.text_area("Enter CIK(s), separated by commas or line breaks.")
+        if manual_ciks_str:
+            # Split on commas or line breaks
+            splitted = manual_ciks_str.replace("\n", ",").split(",")
+            manual_ciks = [x.strip() for x in splitted if x.strip()]
 
-    # --- 2) Trigger search on button click ---
-    if st.button("Search Filings"):
-        # Clean up user inputs
-        tickers = [
-            t.strip().upper() for t in tickers_input.split("\n") 
-            if t.strip()
-        ]
+    run_button = st.button("Run")
 
-        # Create a NetworkClient with your user agent (identity)
-        client = NetworkClient(user_agent=user_agent)
+    if run_button:
+        # Either read from user Excel or create a DataFrame from user-provided CIKs
+        if input_mode == "Upload Excel with CIKs":
+            if not uploaded_file:
+                st.error("Please upload an Excel file before running.")
+                return
+            else:
+                try:
+                    df = pd.read_excel(uploaded_file)
+                    df.columns = df.columns.str.strip()
+                except Exception as e:
+                    st.error(f"Error reading Excel file: {e}")
+                    return
+        else:
+            # Create a minimal DataFrame with columns the code expects
+            df = pd.DataFrame({
+                "CIK": manual_ciks,
+                "Company Name": ["Unknown"] * len(manual_ciks),
+                "Issuer id": ["Unknown"] * len(manual_ciks),
+                "Analyst name": ["Unknown"] * len(manual_ciks)
+            })
 
-        # Prepare a container for search results
-        search_results = []
+        if df is None or df.empty:
+            st.warning("No data to process.")
+            return
 
-        # --- 3) For each ticker, retrieve the desired filings ---
-        for ticker in tickers:
-            st.write(f"### Results for {ticker}")
-            try:
-                # Convert ticker to CIK (if valid)
-                # get_cik_map returns a dict { "TICKER": "CIK" }
-                cik_map = get_cik_map([ticker])
-                cik = cik_map[ticker]  # May raise KeyError if not found
+        results = []
+        for idx, row in df.iterrows():
+            cik_raw = row.get('CIK', None)
+            company_name = row.get('Company Name', 'Unknown')
+            issuer_id    = row.get('Issuer id', 'Unknown')
+            analyst_name = row.get('Analyst name', 'Unknown')
 
-                # For each selected form type, gather filing metadata/urls
-                for form_name in selected_form_types:
-                    filing_type_obj = FORM_TYPE_MAP.get(form_name)
-                    if not filing_type_obj:
-                        continue
+            # Initialize a result dict with standard info
+            result = {
+                "Issuer ID": issuer_id,
+                "CIK": cik_raw,
+                "Company Name": company_name,
+                "FilingAvailable": "No"
+            }
 
-                    # Create Filing object
-                    filing = Filing(
-                        cik_lookup=cik,
-                        filing_type=filing_type_obj,
-                        start_date=start_date,
-                        end_date=end_date,
-                        client=client
-                    )
+            if not cik_raw:
+                # Skip if no CIK
+                results.append(result)
+                continue
 
-                    # `get_urls()` returns a list of filing URLs (no local download).
-                    # If you need more detail, use `get_metadata()` or call `.save()`.
-                    urls = filing.get_urls()
+            # Convert CIK to zero-padded
+            cik_padded = zero_pad_cik(cik_raw)
 
-                    # Append to our results list
-                    search_results.append({
-                        "ticker": ticker,
-                        "cik": cik,
-                        "form_type": form_name,
-                        "urls": urls
-                    })
+            # Fetch JSON from SEC
+            sec_data = fetch_sec_json(cik_padded, HEADERS)
+            if not sec_data or "filings" not in sec_data or "recent" not in sec_data["filings"]:
+                # No data found
+                results.append(result)
+                continue
 
-                    # Display in Streamlit
-                    st.subheader(f"{form_name} Filings:")
-                    if not urls:
-                        st.write(f"No {form_name} filings found in this date range.")
+            recent = sec_data["filings"]["recent"]
+            form_list   = recent.get("form", [])
+            date_list   = recent.get("filingDate", [])
+            accno_list  = recent.get("accessionNumber", [])
+            items_list  = recent.get("items", [])
+
+            link_tracker = defaultdict(list)
+
+            # Loop through recent filings
+            for i in range(len(form_list)):
+                form_type = form_list[i]
+                filing_dt_str = date_list[i]
+                accno_str     = accno_list[i]
+                items_str     = items_list[i] if i < len(items_list) else ""
+
+                # 1) Filter form types
+                if form_type not in forms_we_want:
+                    continue
+
+                # 2) Parse date
+                try:
+                    fdate = datetime.strptime(filing_dt_str, "%Y-%m-%d")
+                except ValueError:
+                    continue
+
+                # 3) Check date filters
+                if start_date_val and fdate < start_date_val:
+                    continue
+                if end_date_val and fdate > end_date_val:
+                    continue
+
+                # 4) Build link
+                accno_nodashes = accno_str.replace('-', '')
+                link = f"https://www.sec.gov/Archives/edgar/data/{int(cik_padded)}/{accno_nodashes}/index.html"
+
+                # 5) Determine base form
+                base_form = FORM_BASE.get(form_type, form_type)
+
+                # 6) If it's an 8-K and user wants to filter on items
+                if base_form == "8-K" and item_filter:
+                    splitted_items = [x.strip() for x in items_str.split(",") if x.strip()]
+                    for it in item_filter:
+                        if it in splitted_items:
+                            col_name = f"8-K({it})"
+                            link_tracker[col_name].append(link)
+                else:
+                    link_tracker[base_form].append(link)
+
+            if link_tracker:
+                result["FilingAvailable"] = "Yes"
+                for col_name, link_list in link_tracker.items():
+                    if len(link_list) == 1:
+                        result[col_name] = link_list[0]
                     else:
-                        for link in urls:
-                            st.write(link)
+                        # first link
+                        result[col_name] = link_list[0]
+                        # subsequent links => col_name_2, col_name_3, ...
+                        for j, lnk in enumerate(link_list[1:], start=2):
+                            result[f"{col_name}_{j}"] = lnk
 
-            except Exception as e:
-                st.error(f"Error fetching data for {ticker}: {str(e)}")
+            results.append(result)
 
-        # Optionally do something with `search_results` here (export to CSV, etc.)
+        # Convert to DataFrame
+        results_df = pd.DataFrame(results)
 
+        # Convert the final DF to an Excel in-memory
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            results_df.to_excel(writer, index=False, sheet_name="Results")
+        processed_data = output.getvalue()
+
+        st.success("Processing complete! Download your results below:")
+        st.download_button(
+            label="Download Excel",
+            data=processed_data,
+            file_name="SEC_filings_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+# ----------------------------------------------------------
+# Streamlit typically runs everything at once, so we wrap
+# the logic in a function and call it here.
+# ----------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    run_app()
