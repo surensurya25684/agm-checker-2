@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import xlsxwriter 
-from xlsxwriter import workbook
+from xlsxwriter import Workbook
 from datetime import datetime
 from collections import defaultdict
 import io
