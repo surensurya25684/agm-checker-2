@@ -6,7 +6,7 @@ from collections import defaultdict
 import io
 
 # -------------------------------------------------
-# Global dictionary definitions from original code
+# Dictionaries for categories and form baselines
 # -------------------------------------------------
 FILING_CATEGORIES = {
     "Annual & Quarterly Reports": ["10-K", "10-K/A", "10-Q", "10-Q/A"],
@@ -41,11 +41,16 @@ FORM_BASE = {
     "PREC14A":   "Proxy",
 
     # Ownership forms -> "Ownership"
-    "3": "Ownership",   "3/A": "Ownership",
-    "4": "Ownership",   "4/A": "Ownership",
-    "5": "Ownership",   "5/A": "Ownership",
-    "SC 13D":   "Ownership",  "SC 13D/A": "Ownership",
-    "SC 13G":   "Ownership",  "SC 13G/A": "Ownership",
+    "3":         "Ownership",
+    "3/A":       "Ownership",
+    "4":         "Ownership",
+    "4/A":       "Ownership",
+    "5":         "Ownership",
+    "5/A":       "Ownership",
+    "SC 13D":    "Ownership",
+    "SC 13D/A":  "Ownership",
+    "SC 13G":    "Ownership",
+    "SC 13G/A":  "Ownership",
 }
 
 def zero_pad_cik(cik):
@@ -63,7 +68,7 @@ def zero_pad_cik(cik):
 def fetch_sec_json(cik_str, headers):
     """
     Given a zero-padded CIK string like '0001156375',
-    fetch the JSON from https://data.sec.gov/submissions/CIK0001156375.json
+    fetch JSON from https://data.sec.gov/submissions/CIK0001156375.json
     Returns a dict or None if error/not found.
     """
     base_url = "https://data.sec.gov/submissions/CIK{}.json"
@@ -80,14 +85,13 @@ def fetch_sec_json(cik_str, headers):
         return None
 
 def run_app():
-    st.title("SEC Filing Search")
+    st.title("SEC Filing Search (Streamlit)")
 
     # 1) User email for the SEC "User-Agent"
     user_email = st.text_input(
-        "Enter your email (will be used in the SEC User-Agent per compliance)",
+        "Enter your email (used in SEC User-Agent per compliance)",
         value="someone@example.com"
     )
-
     HEADERS = {"User-Agent": user_email.strip()}
 
     # 2) Choose category -> forms_we_want
@@ -102,7 +106,7 @@ def run_app():
     start_date = st.date_input("Start Date (optional)", value=None)
     end_date = st.date_input("End Date (optional)", value=None)
 
-    # If user didn't pick them, we treat as None
+    # Convert Streamlit date to actual datetime or None
     start_date_val = None if not start_date else datetime.combine(start_date, datetime.min.time())
     end_date_val = None if not end_date else datetime.combine(end_date, datetime.min.time())
 
@@ -116,7 +120,7 @@ def run_app():
 
     st.write("---")
 
-    # 5) Let the user pick how they want to input CIKs:
+    # 5) Let the user pick how to input CIKs
     st.write("**Choose how to provide CIKs**:")
     input_mode = st.radio(
         "Mode:",
@@ -128,32 +132,33 @@ def run_app():
     df = None  # eventually read from Excel if user uploads
 
     if input_mode == "Upload Excel with CIKs":
-        uploaded_file = st.file_uploader("Upload an Excel file (XLS/XLSX) with columns like 'CIK', 'Company Name', etc.")
+        # This uses openpyxl to read .xlsx
+        uploaded_file = st.file_uploader("Upload an Excel file (XLS or XLSX)")
     else:
         # Manually input CIKs, comma- or line-separated
         manual_ciks_str = st.text_area("Enter CIK(s), separated by commas or line breaks.")
         if manual_ciks_str:
-            # Split on commas or line breaks
             splitted = manual_ciks_str.replace("\n", ",").split(",")
             manual_ciks = [x.strip() for x in splitted if x.strip()]
 
     run_button = st.button("Run")
 
     if run_button:
-        # Either read from user Excel or create a DataFrame from user-provided CIKs
+        # If user uploads an Excel file
         if input_mode == "Upload Excel with CIKs":
             if not uploaded_file:
                 st.error("Please upload an Excel file before running.")
                 return
             else:
                 try:
-                    df = pd.read_excel(uploaded_file)
+                    # Pandas will use openpyxl behind the scenes
+                    df = pd.read_excel(uploaded_file, engine="openpyxl")
                     df.columns = df.columns.str.strip()
                 except Exception as e:
                     st.error(f"Error reading Excel file: {e}")
                     return
         else:
-            # Create a minimal DataFrame with columns the code expects
+            # Create a minimal DataFrame from user-provided CIKs
             df = pd.DataFrame({
                 "CIK": manual_ciks,
                 "Company Name": ["Unknown"] * len(manual_ciks),
@@ -191,7 +196,6 @@ def run_app():
             # Fetch JSON from SEC
             sec_data = fetch_sec_json(cik_padded, HEADERS)
             if not sec_data or "filings" not in sec_data or "recent" not in sec_data["filings"]:
-                # No data found
                 results.append(result)
                 continue
 
@@ -210,7 +214,7 @@ def run_app():
                 accno_str     = accno_list[i]
                 items_str     = items_list[i] if i < len(items_list) else ""
 
-                # 1) Filter form types
+                # 1) Filter by form_type
                 if form_type not in forms_we_want:
                     continue
 
@@ -233,7 +237,7 @@ def run_app():
                 # 5) Determine base form
                 base_form = FORM_BASE.get(form_type, form_type)
 
-                # 6) If it's an 8-K and user wants to filter on items
+                # 6) If 8-K and user wants item filter
                 if base_form == "8-K" and item_filter:
                     splitted_items = [x.strip() for x in items_str.split(",") if x.strip()]
                     for it in item_filter:
@@ -251,13 +255,13 @@ def run_app():
                     else:
                         # first link
                         result[col_name] = link_list[0]
-                        # subsequent links => col_name_2, col_name_3, ...
+                        # subsequent => col_name_2, col_name_3, ...
                         for j, lnk in enumerate(link_list[1:], start=2):
                             result[f"{col_name}_{j}"] = lnk
 
             results.append(result)
 
-        # Convert to DataFrame
+        # Convert results to a DataFrame
         results_df = pd.DataFrame(results)
 
         # Convert the final DF to an Excel in-memory
@@ -275,8 +279,8 @@ def run_app():
         )
 
 # ----------------------------------------------------------
-# Streamlit typically runs everything at once, so we wrap
-# the logic in a function and call it here.
+# Streamlit will run everything on import. We wrap logic in
+# a function and call it under __name__ == "__main__".
 # ----------------------------------------------------------
 if __name__ == "__main__":
     run_app()
