@@ -264,9 +264,9 @@ def run_app():
         # Convert results to a DataFrame
         results_df = pd.DataFrame(results)
 
-        # Convert the final DF to an Excel in-memory
+        # Convert the final DF to an Excel in-memory (using openpyxl for writing)
         output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
             results_df.to_excel(writer, index=False, sheet_name="Results")
         processed_data = output.getvalue()
 
